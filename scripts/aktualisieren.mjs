@@ -347,12 +347,37 @@ function statischeDateien() {
         "v1/nachrichten/index.json", "v1/nachrichten/{feed}.json", "v1/faktenchecks.json",
         "v1/spenden/index.json", "v1/spenden/{jahr}.json", "v1/eurostat/index.json", "v1/eurostat/{preset}.json",
         "v1/weltbank/index.json", "v1/weltbank/{preset}.json", "v1/abgeordnetenwatch/bundestag.json", "v1/dip/ordnungsrufe.json",
+        "v1/parlament.json",
       ],
     }),
     "v1/nachrichten/index.json": j({ feeds: Object.entries(FEEDS).map(([id, f]) => ({ id, name: f.name, url: f.seite })) }),
     "v1/spenden/index.json": j({ aktuellesJahr: aktuell, jahre: Array.from({ length: aktuell - 2002 + 1 }, (_, i) => aktuell - i) }),
     "v1/eurostat/index.json": j({ presets: Object.entries(EUROSTAT).map(([id, p]) => ({ id, dataset: p.dataset, einheit: p.einheit, takt: p.takt })) }),
     "v1/weltbank/index.json": j({ presets: Object.entries(WELTBANK).map(([id, p]) => ({ id, indikator: p.code, einheit: p.einheit })) }),
+        "v1/parlament.json": j({
+      quelle: { name: "Deutscher Bundestag", url: "https://www.bundestag.de/parlament/plenum/sitzverteilung" },
+      stand: "2026-11-25",
+      amtsinhaber: [
+        { amt: "Bundespräsident", name: "Frank-Walter Steinmeier", seit: "2017-03-19" },
+        { amt: "Bundeskanzler", name: "Friedrich Merz", seit: "2025-05-06" },
+        { amt: "Vizekanzler", name: "Lars Klingbeil", seit: "2025-05-06" },
+        { amt: "Bundestagspräsidentin", name: "Julia Klöckner", seit: "2025-03-25" },
+      ],
+      bundestag: {
+        wahlperiode: 21,
+        gesamt: 630,
+        stand: "2025-02-23",
+        regierung: ["CDU/CSU", "SPD"],
+        fraktionen: [
+          { name: "CDU/CSU", sitze: 208 },
+          { name: "AfD", sitze: 152 },
+          { name: "SPD", sitze: 120 },
+          { name: "Grüne", sitze: 85 },
+          { name: "Linke", sitze: 64 },
+          { name: "SSW", sitze: 1 },
+        ],
+      },
+    }),
   };
 }
 
