@@ -354,9 +354,9 @@ function statischeDateien() {
     "v1/spenden/index.json": j({ aktuellesJahr: aktuell, jahre: Array.from({ length: aktuell - 2002 + 1 }, (_, i) => aktuell - i) }),
     "v1/eurostat/index.json": j({ presets: Object.entries(EUROSTAT).map(([id, p]) => ({ id, dataset: p.dataset, einheit: p.einheit, takt: p.takt })) }),
     "v1/weltbank/index.json": j({ presets: Object.entries(WELTBANK).map(([id, p]) => ({ id, indikator: p.code, einheit: p.einheit })) }),
-        "v1/parlament.json": j({
+    "v1/parlament.json": j({
       quelle: { name: "Deutscher Bundestag", url: "https://www.bundestag.de/parlament/plenum/sitzverteilung" },
-      stand: "2026-11-25",
+      stand: "2026-11-27",
       amtsinhaber: [
         { amt: "Bundespräsident", name: "Frank-Walter Steinmeier", seit: "2017-03-19" },
         { amt: "Bundeskanzler", name: "Friedrich Merz", seit: "2025-05-06" },
@@ -375,6 +375,53 @@ function statischeDateien() {
           { name: "Grüne", sitze: 85 },
           { name: "Linke", sitze: 64 },
           { name: "SSW", sitze: 1 },
+        ],
+      },
+      frauenanteil: {
+        aktuell: 32.4,
+        frauen: 204,
+        verlauf: [
+          { jahr: 1949, anteil: 6.8 }, { jahr: 1953, anteil: 8.8 }, { jahr: 1957, anteil: 9.2 },
+          { jahr: 1961, anteil: 8.3 }, { jahr: 1965, anteil: 6.9 }, { jahr: 1969, anteil: 6.6 },
+          { jahr: 1972, anteil: 5.8 }, { jahr: 1976, anteil: 7.3 }, { jahr: 1980, anteil: 8.5 },
+          { jahr: 1983, anteil: 9.8 }, { jahr: 1987, anteil: 15.4 }, { jahr: 1990, anteil: 20.5 },
+          { jahr: 1994, anteil: 26.2 }, { jahr: 1998, anteil: 30.9 }, { jahr: 2002, anteil: 32.8 },
+          { jahr: 2005, anteil: 31.6 }, { jahr: 2009, anteil: 32.8 }, { jahr: 2013, anteil: 36.3 },
+          { jahr: 2017, anteil: 30.7 }, { jahr: 2021, anteil: 34.8 }, { jahr: 2025, anteil: 32.4 },
+        ],
+      },
+      alter: {
+        gesamt: 47.1,
+        frauen: 44.8,
+        maenner: 48.2,
+        vorherigeWahl: 47.3,
+        hoechsteFraktionen: [
+          { name: "AfD", alter: 50.7 },
+          { name: "CSU", alter: 48.3 },
+        ],
+        rekorde: [
+          { name: "Höchster Wert (1961)", alter: 52.3 },
+          { name: "Niedrigster Wert (1972)", alter: 46.6 },
+        ],
+      },
+      direktmandate: {
+        wahlkreise: 299,
+        mitMandat: 276,
+        ohneMandat: 23,
+        parteien: [
+          { name: "CDU", wahlkreissiege: 143, mandate: 128 },
+          { name: "CSU", wahlkreissiege: 47, mandate: 44 },
+          { name: "AfD", wahlkreissiege: 46, mandate: 42 },
+          { name: "SPD", wahlkreissiege: 45, mandate: 44 },
+          { name: "Grüne", wahlkreissiege: 12, mandate: 12 },
+          { name: "Linke", wahlkreissiege: 6, mandate: 6 },
+        ],
+        wahl2021: [
+          { name: "CDU/CSU", wahlkreissiege: 143 },
+          { name: "SPD", wahlkreissiege: 121 },
+          { name: "AfD", wahlkreissiege: 16 },
+          { name: "Grüne", wahlkreissiege: 16 },
+          { name: "Linke", wahlkreissiege: 3 },
         ],
       },
     }),
