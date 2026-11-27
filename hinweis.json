@@ -1,5 +1,5 @@
 {
-  "aktiv": true,
+  "aktiv": false,
   "farbe": "gelb",
   "titel": "Beispiel-Titel",
   "text": "Hier steht dein Text. Er wird genau so angezeigt, wie du ihn schreibst.",
