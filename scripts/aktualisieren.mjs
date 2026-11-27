@@ -6,6 +6,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { inflateRawSync } from "node:zlib";
 
 const UA = "Politikatlas/1.0 (+https://politikatlas.com)";
 const CACHE = ".cache";
@@ -20,6 +21,9 @@ const QUELLEN = {
   weltbank: { name: "Weltbank", url: "https://data.worldbank.org/", lizenz: "CC BY 4.0", lizenzUrl: "https://creativecommons.org/licenses/by/4.0/" },
   abgeordnetenwatch: { name: "abgeordnetenwatch.de", url: "https://www.abgeordnetenwatch.de/api", lizenz: null, lizenzUrl: null },
   dip: { name: "DIP – Deutscher Bundestag", url: "https://search.dip.bundestag.de/api/v1/swagger-ui/", lizenz: null, lizenzUrl: null },
+  bundestagStammdaten: { name: "Deutscher Bundestag – Stammdaten aller Abgeordneten seit 1949", url: "https://www.bundestag.de/services/opendata", lizenz: null, lizenzUrl: null },
+  bundeswahlleiterin: { name: "Die Bundeswahlleiterin – Wahlkreisergebnisse", url: "https://www.bundeswahlleiterin.de/bundestagswahlen/", lizenz: "Datenlizenz Deutschland – Namensnennung – Version 2.0", lizenzUrl: "https://www.govdata.de/dl-de/by-2-0" },
+  wikidata: { name: "Wikidata", url: "https://www.wikidata.org/", lizenz: "CC0 1.0", lizenzUrl: "https://creativecommons.org/publicdomain/zero/1.0/" },
 };
 
 const FEEDS = {
@@ -319,6 +323,413 @@ async function jobDip() {
   return { "v1/dip/ordnungsrufe.json": body("dip", { wahlperiode: wp, vorgaenge: vorgaenge.filter((x) => Number(x.wahlperiode) === wp) }) };
 }
 
+// ---------- Parlament: Stammdaten des Bundestages, Wahlkreisergebnisse, Amtsinhaber ----------
+// Alles wird live aus Quellen berechnet. Fällt eine Teilquelle aus, bleibt der letzte Stand erhalten.
+
+const STAMMDATEN_FALLBACK = "https://www.bundestag.de/resource/blob/472878/MdB-Stammdaten-data.zip";
+
+async function holeBytes(url, { timeout = 120000 } = {}) {
+  const res = await fetch(url, { headers: { "user-agent": UA, accept: "*/*" }, signal: AbortSignal.timeout(timeout) });
+  if (!res.ok) throw new Error(`${new URL(url).host} antwortete mit HTTP ${res.status}`);
+  return { daten: Buffer.from(await res.arrayBuffer()), geaendert: res.headers.get("last-modified") };
+}
+
+/** Liest die erste Datei mit passender Endung aus einem ZIP (ohne Abhängigkeiten). */
+function dateiAusZip(buf, endung) {
+  let ende = -1;
+  for (let i = buf.length - 22; i >= Math.max(0, buf.length - 65557); i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { ende = i; break; }
+  }
+  if (ende < 0) throw new Error("ZIP ohne Verzeichnis");
+  const anzahl = buf.readUInt16LE(ende + 10);
+  let pos = buf.readUInt32LE(ende + 16);
+  for (let n = 0; n < anzahl; n++) {
+    if (buf.readUInt32LE(pos) !== 0x02014b50) break;
+    const methode = buf.readUInt16LE(pos + 10);
+    const komprimiert = buf.readUInt32LE(pos + 20);
+    const nameLen = buf.readUInt16LE(pos + 28);
+    const extraLen = buf.readUInt16LE(pos + 30);
+    const kommentarLen = buf.readUInt16LE(pos + 32);
+    const lokal = buf.readUInt32LE(pos + 42);
+    const name = buf.toString("utf8", pos + 46, pos + 46 + nameLen);
+    pos += 46 + nameLen + extraLen + kommentarLen;
+    if (!name.toLowerCase().endsWith(endung)) continue;
+    const start = lokal + 30 + buf.readUInt16LE(lokal + 26) + buf.readUInt16LE(lokal + 28);
+    const roh = buf.subarray(start, start + komprimiert);
+    return methode === 0 ? roh : inflateRawSync(roh);
+  }
+  throw new Error(`Keine ${endung}-Datei im ZIP`);
+}
+
+function dekodiereXml(bytes) {
+  const kopf = bytes.subarray(0, 200).toString("latin1");
+  const enc = /encoding=["']([^"']+)["']/i.exec(kopf)?.[1] ?? "utf-8";
+  let text;
+  try {
+    text = new TextDecoder(enc).decode(bytes);
+  } catch {
+    text = new TextDecoder("utf-8").decode(bytes);
+  }
+  return text.replace(/^﻿/, "");
+}
+
+const xmlTag = (s, t) => {
+  const m = new RegExp(`<${t}>([\\s\\S]*?)</${t}>`).exec(s);
+  return m ? entit(m[1].replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")).trim() : "";
+};
+const xmlBloecke = (s, t) => [...s.matchAll(new RegExp(`<${t}>[\\s\\S]*?</${t}>`, "g"))].map((m) => m[0]);
+
+function leseStammdaten(xml) {
+  return xmlBloecke(xml, "MDB").map((m) => ({
+    geburt: isoVonDeutsch(xmlTag(m, "GEBURTSDATUM")),
+    weiblich: /weib/i.test(xmlTag(m, "GESCHLECHT")),
+    partei: xmlTag(m, "PARTEI_KURZ"),
+    wps: xmlBloecke(m, "WAHLPERIODE").map((w) => ({
+      wp: Number(xmlTag(w, "WP")),
+      von: isoVonDeutsch(xmlTag(w, "MDBWP_VON")),
+      bis: isoVonDeutsch(xmlTag(w, "MDBWP_BIS")),
+      art: xmlTag(w, "MANDATSART"),
+      inst: xmlBloecke(w, "INSTITUTION").map((i) => ({
+        art: xmlTag(i, "INSART_LANG"),
+        name: xmlTag(i, "INS_LANG"),
+        von: isoVonDeutsch(xmlTag(i, "MDBINS_VON")),
+        bis: isoVonDeutsch(xmlTag(i, "MDBINS_BIS")),
+      })),
+    })),
+  }));
+}
+
+function parteiKurz(p) {
+  const t = String(p ?? "").toLowerCase().trim();
+  if (t === "cdu") return "CDU";
+  if (t === "csu") return "CSU";
+  if (/spd|sozialdemokrat/.test(t)) return "SPD";
+  if (/afd|alternative für/.test(t)) return "AfD";
+  if (/grüne|gruene|bündnis 90|buendnis 90/.test(t)) return "Grüne";
+  if (/linke|pds/.test(t)) return "Linke";
+  if (/fdp|freie demokrat/.test(t)) return "FDP";
+  if (/bsw|wagenknecht/.test(t)) return "BSW";
+  if (/ssw|südschleswig/.test(t)) return "SSW";
+  if (/freie wähler/.test(t)) return "Freie Wähler";
+  return String(p ?? "").trim();
+}
+
+function fraktionKurz(n) {
+  const t = String(n ?? "").toLowerCase();
+  if (!t || /fraktionslos/.test(t)) return null;
+  if (/linke|pds/.test(t)) return "Linke";
+  if (/christlich|cdu|csu/.test(t)) return "CDU/CSU";
+  if (/sozialdemokrat|spd/.test(t)) return "SPD";
+  if (/alternative für|afd/.test(t)) return "AfD";
+  if (/grüne|gruene|bündnis 90/.test(t)) return "Grüne";
+  if (/freie demokrat|fdp/.test(t)) return "FDP";
+  if (/wagenknecht|bsw/.test(t)) return "BSW";
+  return String(n).replace(/^(Fraktion|Gruppe)\s+(der|des|die)?\s*/i, "").trim() || null;
+}
+
+const mittel = (a) => a.reduce((s, x) => s + x, 0) / a.length;
+const rund1 = (x) => Math.round(x * 10) / 10;
+const alterAm = (geburt, tag) => (Date.parse(tag) - Date.parse(geburt)) / (365.2425 * 864e5);
+
+function fraktionAm(eintrag, tag) {
+  const treffer = eintrag.w.inst.find(
+    (i) => /fraktion|gruppe/i.test(i.art) && (!i.von || i.von <= tag) && (!i.bis || i.bis >= tag),
+  );
+  const name = fraktionKurz(treffer?.name);
+  if (name) return name;
+  return parteiKurz(eintrag.m.partei) === "SSW" ? "SSW" : "Fraktionslos";
+}
+
+/** Rechnet alle Kennzahlen aus den Stammdaten. "Zu Beginn" ist der Tag, an dem die meisten Mitglieder ihr Mandat antraten. */
+function werteAus(mitglieder, heute) {
+  const proWp = new Map();
+  for (const m of mitglieder) {
+    for (const w of m.wps) {
+      if (!Number.isFinite(w.wp) || !w.von) continue;
+      if (!proWp.has(w.wp)) proWp.set(w.wp, []);
+      proWp.get(w.wp).push({ m, w });
+    }
+  }
+  const wps = [...proWp.keys()].sort((a, b) => a - b);
+  if (wps.length < 2) throw new Error("Zu wenige Wahlperioden in den Stammdaten");
+  const aktuell = wps.at(-1);
+
+  const beginn = (wp) => {
+    const liste = proWp.get(wp);
+    const zaehler = new Map();
+    for (const x of liste) zaehler.set(x.w.von, (zaehler.get(x.w.von) ?? 0) + 1);
+    const start = [...zaehler.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))[0][0];
+    return { start, liste: liste.filter((x) => x.w.von === start) };
+  };
+
+  // Frauenanteil und Durchschnittsalter zu Beginn jeder Wahlperiode
+  const verlauf = [];
+  const altersMittel = new Map();
+  for (const wp of wps) {
+    const { start, liste } = beginn(wp);
+    if (liste.length < 100) continue;
+    const frauen = liste.filter((x) => x.m.weiblich).length;
+    verlauf.push({ jahr: Number(start.slice(0, 4)), anteil: rund1((frauen / liste.length) * 100) });
+    const alter = liste.filter((x) => x.m.geburt).map((x) => alterAm(x.m.geburt, start));
+    if (alter.length) altersMittel.set(wp, { jahr: Number(start.slice(0, 4)), alter: mittel(alter) });
+  }
+
+  // Aktuelle Sitze
+  const aktuelleListe = proWp.get(aktuell).filter((x) => x.w.von <= heute && (!x.w.bis || x.w.bis >= heute));
+  const sitze = new Map();
+  for (const x of aktuelleListe) {
+    const f = fraktionAm(x, heute);
+    sitze.set(f, (sitze.get(f) ?? 0) + 1);
+  }
+  const fraktionen = [...sitze.entries()]
+    .map(([name, anzahl]) => ({ name, sitze: anzahl }))
+    .sort((a, b) => {
+      if (a.name === "Fraktionslos") return 1;
+      if (b.name === "Fraktionslos") return -1;
+      return b.sitze - a.sitze || a.name.localeCompare(b.name, "de");
+    });
+  const frauenAktuell = aktuelleListe.filter((x) => x.m.weiblich).length;
+
+  // Alter zu Beginn der aktuellen Wahlperiode
+  const { start, liste: startListe } = beginn(aktuell);
+  const mitAlter = startListe.filter((x) => x.m.geburt).map((x) => ({ x, alter: alterAm(x.m.geburt, start) }));
+  const nachFraktion = new Map();
+  for (const { x, alter } of mitAlter) {
+    const f = fraktionAm(x, start);
+    if (!nachFraktion.has(f)) nachFraktion.set(f, []);
+    nachFraktion.get(f).push(alter);
+  }
+  const hoechsteFraktionen = [...nachFraktion.entries()]
+    .filter(([name, a]) => a.length >= 5 && name !== "Fraktionslos")
+    .map(([name, a]) => ({ name, alter: rund1(mittel(a)) }))
+    .sort((a, b) => b.alter - a.alter)
+    .slice(0, 2);
+  const rekorde = [...altersMittel.values()];
+  const hoch = rekorde.reduce((a, b) => (b.alter > a.alter ? b : a));
+  const tief = rekorde.reduce((a, b) => (b.alter < a.alter ? b : a));
+  const vorher = altersMittel.get(wps.at(-2));
+  if (!vorher) throw new Error("Keine Daten zur vorherigen Wahlperiode");
+
+  const frauenAlter = mitAlter.filter((e) => e.x.m.weiblich).map((e) => e.alter);
+  const maennerAlter = mitAlter.filter((e) => !e.x.m.weiblich).map((e) => e.alter);
+
+  // Direktmandate zu Beginn der aktuellen und der vorherigen Wahlperiode
+  const direkt = (liste) => {
+    const nachPartei = new Map();
+    for (const x of liste.filter((e) => /direkt/i.test(e.w.art))) {
+      const p = parteiKurz(x.m.partei);
+      nachPartei.set(p, (nachPartei.get(p) ?? 0) + 1);
+    }
+    return nachPartei;
+  };
+  const direktAktuell = direkt(startListe);
+  const vorherZusammen = new Map();
+  for (const [p, n] of direkt(beginn(wps.at(-2)).liste)) {
+    const name = p === "CDU" || p === "CSU" ? "CDU/CSU" : p;
+    vorherZusammen.set(name, (vorherZusammen.get(name) ?? 0) + n);
+  }
+
+  return {
+    wahlperiode: aktuell,
+    wahljahr: Number(start.slice(0, 4)),
+    gesamt: aktuelleListe.length,
+    fraktionen,
+    frauenanteil: {
+      aktuell: rund1((frauenAktuell / aktuelleListe.length) * 100),
+      frauen: frauenAktuell,
+      verlauf,
+    },
+    alter: {
+      gesamt: rund1(mittel(mitAlter.map((e) => e.alter))),
+      frauen: rund1(mittel(frauenAlter)),
+      maenner: rund1(mittel(maennerAlter)),
+      vorherigeWahl: rund1(vorher.alter),
+      hoechsteFraktionen,
+      rekorde: [
+        { name: `Höchster Wert (${hoch.jahr})`, alter: rund1(hoch.alter) },
+        { name: `Niedrigster Wert (${tief.jahr})`, alter: rund1(tief.alter) },
+      ],
+    },
+    direktAktuell,
+    direktGesamt: [...direktAktuell.values()].reduce((s, n) => s + n, 0),
+    direktVorher: [...vorherZusammen.entries()]
+      .map(([name, n]) => ({ name, wahlkreissiege: n }))
+      .sort((a, b) => b.wahlkreissiege - a.wahlkreissiege || a.name.localeCompare(b.name, "de")),
+  };
+}
+
+/** Wahlkreissieger nach Erststimmen aus kerg2.csv der Bundeswahlleiterin. */
+function wahlkreissieger(csv) {
+  const zeilen = csv.replace(/^﻿/, "").split(/\r?\n/);
+  const k = zeilen.findIndex((z) => z.startsWith("Wahlart;Wahltag;Gebietsart"));
+  if (k < 0) throw new Error("kerg2.csv ohne Kopfzeile");
+  const spalten = zeilen[k].split(";");
+  const [iArt, iNr, iGruppenart, iName, iStimme, iAnzahl] =
+    ["Gebietsart", "Gebietsnummer", "Gruppenart", "Gruppenname", "Stimme", "Anzahl"].map((n) => spalten.indexOf(n));
+  if ([iArt, iNr, iGruppenart, iName, iStimme, iAnzahl].some((i) => i < 0)) throw new Error("kerg2.csv hat unerwartete Spalten");
+
+  const beste = new Map();
+  for (const z of zeilen.slice(k + 1)) {
+    const f = z.split(";");
+    if (f[iArt] !== "Wahlkreis" || f[iStimme] !== "1" || f[iAnzahl] === "" || f[iAnzahl] === undefined) continue;
+    const einzel = /einzelbewerber/i.test(f[iGruppenart]);
+    if (f[iGruppenart] !== "Partei" && !einzel) continue;
+    const anzahl = Number(f[iAnzahl]);
+    if (!Number.isFinite(anzahl)) continue;
+    const alt = beste.get(f[iNr]);
+    if (!alt || anzahl > alt.anzahl) beste.set(f[iNr], { anzahl, partei: einzel ? "Einzelbewerber" : parteiKurz(f[iName]) });
+  }
+  if (beste.size < 200) throw new Error("Zu wenige Wahlkreise in kerg2.csv");
+  return beste;
+}
+
+async function ladeDirektmandate(w) {
+  const yy = String(w.wahljahr).slice(2);
+  const url = `https://www.bundeswahlleiterin.de/bundestagswahlen/${w.wahljahr}/ergebnisse/opendata/btw${yy}/csv/kerg2.csv`;
+  const beste = wahlkreissieger(await holeText(url, { timeout: 90000 }));
+  const siege = new Map();
+  for (const { partei } of beste.values()) siege.set(partei, (siege.get(partei) ?? 0) + 1);
+
+  const namen = new Set([...siege.keys(), ...w.direktAktuell.keys()]);
+  namen.delete("Einzelbewerber");
+  const parteien = [...namen]
+    .map((name) => {
+      const mandate = w.direktAktuell.get(name) ?? 0;
+      return { name, wahlkreissiege: Math.max(siege.get(name) ?? 0, mandate), mandate };
+    })
+    .filter((p) => p.wahlkreissiege > 0)
+    .sort((a, b) => b.wahlkreissiege - a.wahlkreissiege || a.name.localeCompare(b.name, "de"));
+
+  return {
+    wahlkreise: beste.size,
+    mitMandat: w.direktGesamt,
+    ohneMandat: beste.size - w.direktGesamt,
+    parteien,
+    wahl2021: w.direktVorher,
+  };
+}
+
+/** Amtsinhaber aus Wikidata. Die Regierungsfraktionen ergeben sich aus den Parteien von Kanzler und Vizekanzler. */
+async function ladeAmtsinhaber() {
+  const abfrage = `
+SELECT ?amt ?person ?personLabel ?start ?sex ?parteiLabel WHERE {
+  {
+    wd:Q183 p:P35 ?st . ?st ps:P35 ?person .
+    BIND("Bundespräsident" AS ?amt)
+  } UNION {
+    wd:Q183 p:P6 ?st . ?st ps:P6 ?person .
+    BIND("Bundeskanzler" AS ?amt)
+  } UNION {
+    VALUES ?pl { "Vizekanzler von Deutschland"@de "Vizekanzler"@de "Vice Chancellor of Germany"@en "Vice-Chancellor of Germany"@en
+                 "Präsident des Deutschen Bundestages"@de "Bundestagspräsident"@de "President of the Bundestag"@en }
+    ?pos rdfs:label ?pl .
+    ?person p:P39 ?st . ?st ps:P39 ?pos .
+    BIND(STR(?pl) AS ?amt)
+  }
+  FILTER NOT EXISTS { ?st pq:P582 ?ende }
+  OPTIONAL { ?st pq:P580 ?start }
+  OPTIONAL { ?person wdt:P21 ?sex }
+  OPTIONAL { ?person p:P102 ?ps . ?ps ps:P102 ?partei . FILTER NOT EXISTS { ?ps pq:P582 ?pende } }
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "de,en". }
+}`;
+  const roh = JSON.parse(await holeText(`https://query.wikidata.org/sparql?format=json&query=${encodeURIComponent(abfrage)}`, { timeout: 60000 }));
+  const zeilen = roh.results?.bindings ?? [];
+
+  const bezeichnung = (s) => (/vice|vize/i.test(s) ? "Vizekanzler" : /bundestag/i.test(s) ? "Bundestagspräsident" : s);
+  const proAmt = new Map();
+  for (const z of zeilen) {
+    const amt = bezeichnung(z.amt.value);
+    const start = z.start?.value ?? "";
+    const alt = proAmt.get(amt);
+    if (!alt || start > alt.start) {
+      proAmt.set(amt, { start, person: z.person.value, name: z.personLabel?.value ?? "", weiblich: z.sex?.value?.endsWith("Q6581072") ?? false });
+    }
+  }
+
+  const reihenfolge = ["Bundespräsident", "Bundeskanzler", "Vizekanzler", "Bundestagspräsident"];
+  const amtsinhaber = reihenfolge
+    .filter((a) => proAmt.get(a)?.name && !/^Q\d+$/.test(proAmt.get(a).name))
+    .map((a) => {
+      const p = proAmt.get(a);
+      return { amt: p.weiblich ? `${a}in` : a, name: p.name, seit: p.start ? p.start.slice(0, 10) : null };
+    });
+
+  const parteienVon = (amt) => {
+    const p = proAmt.get(amt);
+    if (!p) return [];
+    return zeilen
+      .filter((z) => bezeichnung(z.amt.value) === amt && z.person.value === p.person && z.parteiLabel)
+      .map((z) => fraktionKurz(z.parteiLabel.value))
+      .filter(Boolean);
+  };
+  const kanzler = parteienVon("Bundeskanzler");
+  const vize = parteienVon("Vizekanzler");
+  const regierung = kanzler.length && vize.length ? [...new Set([...kanzler, ...vize])] : null;
+
+  return { amtsinhaber, regierung };
+}
+
+async function vorherigeDatei(pfad) {
+  try {
+    return JSON.parse((await ladeCache("parlament"))?.dateien?.[pfad]);
+  } catch {
+    return null;
+  }
+}
+
+async function stammdatenUrl() {
+  try {
+    const html = await holeText("https://www.bundestag.de/services/opendata");
+    const m = /href="([^"]*MdB-Stammdaten[^"]*\.zip)"/i.exec(html);
+    const link = m ? sicheresLink(entit(m[1]), "https://www.bundestag.de/") : null;
+    if (link) return link;
+  } catch {
+    // Fallback unten
+  }
+  return STAMMDATEN_FALLBACK;
+}
+
+async function jobParlament() {
+  const vorher = await vorherigeDatei("v1/parlament.json");
+  const heute = new Date().toISOString().slice(0, 10);
+
+  const { daten, geaendert } = await holeBytes(await stammdatenUrl());
+  const mitglieder = leseStammdaten(dekodiereXml(dateiAusZip(daten, ".xml")));
+  if (mitglieder.length < 1000) throw new Error("Stammdaten unvollständig");
+  const w = werteAus(mitglieder, heute);
+  if (w.gesamt < 500) throw new Error("Unplausible Zahl aktueller Mitglieder");
+
+  let direktmandate = vorher?.direktmandate;
+  try {
+    direktmandate = await ladeDirektmandate(w);
+  } catch (e) {
+    console.warn(`Direktmandate: ${e.message}`);
+  }
+
+  let amtsinhaber = vorher?.amtsinhaber ?? [];
+  let regierung = vorher?.bundestag?.regierung ?? [];
+  try {
+    const wd = await ladeAmtsinhaber();
+    if (wd.amtsinhaber.length) amtsinhaber = wd.amtsinhaber;
+    if (wd.regierung) regierung = wd.regierung;
+  } catch (e) {
+    console.warn(`Amtsinhaber: ${e.message}`);
+  }
+
+  const stand = geaendert && Number.isFinite(Date.parse(geaendert)) ? new Date(geaendert).toISOString().slice(0, 10) : heute;
+  return {
+    "v1/parlament.json": body("bundestagStammdaten", {
+      quellen: [QUELLEN.bundeswahlleiterin, QUELLEN.wikidata],
+      stand: heute,
+      amtsinhaber,
+      bundestag: { wahlperiode: w.wahlperiode, gesamt: w.gesamt, stand, regierung, fraktionen: w.fraktionen },
+      frauenanteil: w.frauenanteil,
+      alter: w.alter,
+      ...(direktmandate ? { direktmandate } : {}),
+    }),
+  };
+}
+
 function jobs() {
   const jahr = new Date().getUTCFullYear();
   const liste = [
@@ -332,6 +743,7 @@ function jobs() {
   for (let j = 2002; j <= jahr; j++) {
     liste.push({ id: `spenden:${j}`, quelle: "bundestag", alleMinuten: j >= jahr - 1 ? 360 : 43200, run: jobSpenden(j) });
   }
+  liste.push({ id: "parlament", quelle: "bundestagStammdaten", alleMinuten: 720, run: jobParlament });
   if (process.env.DIP_KEY) liste.push({ id: "dip", quelle: "dip", alleMinuten: 360, run: jobDip });
   return liste;
 }
@@ -346,85 +758,13 @@ function statischeDateien() {
         "v1/status.json", "v1/umfragen/index.json", "v1/umfragen/{parlament}.json", "v1/umfragen/{parlament}-alle.json",
         "v1/nachrichten/index.json", "v1/nachrichten/{feed}.json", "v1/faktenchecks.json",
         "v1/spenden/index.json", "v1/spenden/{jahr}.json", "v1/eurostat/index.json", "v1/eurostat/{preset}.json",
-        "v1/weltbank/index.json", "v1/weltbank/{preset}.json", "v1/abgeordnetenwatch/bundestag.json", "v1/dip/ordnungsrufe.json",
-        "v1/parlament.json",
+        "v1/weltbank/index.json", "v1/weltbank/{preset}.json", "v1/abgeordnetenwatch/bundestag.json", "v1/dip/ordnungsrufe.json", "v1/parlament.json",
       ],
     }),
     "v1/nachrichten/index.json": j({ feeds: Object.entries(FEEDS).map(([id, f]) => ({ id, name: f.name, url: f.seite })) }),
     "v1/spenden/index.json": j({ aktuellesJahr: aktuell, jahre: Array.from({ length: aktuell - 2002 + 1 }, (_, i) => aktuell - i) }),
     "v1/eurostat/index.json": j({ presets: Object.entries(EUROSTAT).map(([id, p]) => ({ id, dataset: p.dataset, einheit: p.einheit, takt: p.takt })) }),
     "v1/weltbank/index.json": j({ presets: Object.entries(WELTBANK).map(([id, p]) => ({ id, indikator: p.code, einheit: p.einheit })) }),
-    "v1/parlament.json": j({
-      quelle: { name: "Deutscher Bundestag", url: "https://www.bundestag.de/parlament/plenum/sitzverteilung" },
-      stand: "2026-11-27",
-      amtsinhaber: [
-        { amt: "Bundespräsident", name: "Frank-Walter Steinmeier", seit: "2017-03-19" },
-        { amt: "Bundeskanzler", name: "Friedrich Merz", seit: "2025-05-06" },
-        { amt: "Vizekanzler", name: "Lars Klingbeil", seit: "2025-05-06" },
-        { amt: "Bundestagspräsidentin", name: "Julia Klöckner", seit: "2025-03-25" },
-      ],
-      bundestag: {
-        wahlperiode: 21,
-        gesamt: 630,
-        stand: "2025-02-23",
-        regierung: ["CDU/CSU", "SPD"],
-        fraktionen: [
-          { name: "CDU/CSU", sitze: 208 },
-          { name: "AfD", sitze: 152 },
-          { name: "SPD", sitze: 120 },
-          { name: "Grüne", sitze: 85 },
-          { name: "Linke", sitze: 64 },
-          { name: "SSW", sitze: 1 },
-        ],
-      },
-      frauenanteil: {
-        aktuell: 32.4,
-        frauen: 204,
-        verlauf: [
-          { jahr: 1949, anteil: 6.8 }, { jahr: 1953, anteil: 8.8 }, { jahr: 1957, anteil: 9.2 },
-          { jahr: 1961, anteil: 8.3 }, { jahr: 1965, anteil: 6.9 }, { jahr: 1969, anteil: 6.6 },
-          { jahr: 1972, anteil: 5.8 }, { jahr: 1976, anteil: 7.3 }, { jahr: 1980, anteil: 8.5 },
-          { jahr: 1983, anteil: 9.8 }, { jahr: 1987, anteil: 15.4 }, { jahr: 1990, anteil: 20.5 },
-          { jahr: 1994, anteil: 26.2 }, { jahr: 1998, anteil: 30.9 }, { jahr: 2002, anteil: 32.8 },
-          { jahr: 2005, anteil: 31.6 }, { jahr: 2009, anteil: 32.8 }, { jahr: 2013, anteil: 36.3 },
-          { jahr: 2017, anteil: 30.7 }, { jahr: 2021, anteil: 34.8 }, { jahr: 2025, anteil: 32.4 },
-        ],
-      },
-      alter: {
-        gesamt: 47.1,
-        frauen: 44.8,
-        maenner: 48.2,
-        vorherigeWahl: 47.3,
-        hoechsteFraktionen: [
-          { name: "AfD", alter: 50.7 },
-          { name: "CSU", alter: 48.3 },
-        ],
-        rekorde: [
-          { name: "Höchster Wert (1961)", alter: 52.3 },
-          { name: "Niedrigster Wert (1972)", alter: 46.6 },
-        ],
-      },
-      direktmandate: {
-        wahlkreise: 299,
-        mitMandat: 276,
-        ohneMandat: 23,
-        parteien: [
-          { name: "CDU", wahlkreissiege: 143, mandate: 128 },
-          { name: "CSU", wahlkreissiege: 47, mandate: 44 },
-          { name: "AfD", wahlkreissiege: 46, mandate: 42 },
-          { name: "SPD", wahlkreissiege: 45, mandate: 44 },
-          { name: "Grüne", wahlkreissiege: 12, mandate: 12 },
-          { name: "Linke", wahlkreissiege: 6, mandate: 6 },
-        ],
-        wahl2021: [
-          { name: "CDU/CSU", wahlkreissiege: 143 },
-          { name: "SPD", wahlkreissiege: 121 },
-          { name: "AfD", wahlkreissiege: 16 },
-          { name: "Grüne", wahlkreissiege: 16 },
-          { name: "Linke", wahlkreissiege: 3 },
-        ],
-      },
-    }),
   };
 }
 
