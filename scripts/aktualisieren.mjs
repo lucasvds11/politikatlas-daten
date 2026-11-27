@@ -3,6 +3,7 @@
 // Lauf: node scripts/aktualisieren.mjs   (Node 20+, keine Abhängigkeiten)
 // Von Hand gepflegt: hinweis.json im Hauptordner (Hinweis-Box der App, siehe hinweisDatei)
 // Optionales Secret: DIP_KEY (Bundestag DIP)
+// Optional: ALLES_NEU=1 erzwingt alle Abrufe, unabhängig von den Intervallen (für manuelle Läufe)
 
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -59,13 +60,29 @@ const WELTBANK = {
 
 // ---------- Hilfsfunktionen ----------
 
-async function holeText(url, { timeout = 30000, accept = "*/*" } = {}) {
-  const res = await fetch(url, {
-    headers: { "user-agent": UA, accept },
-    signal: AbortSignal.timeout(timeout),
-  });
-  if (!res.ok) throw new Error(`${new URL(url).host} antwortete mit HTTP ${res.status}`);
-  return res.text();
+const warte = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Wiederholt bei vorübergehenden Fehlern: Netzwerkfehler, Zeitüberschreitung, HTTP 429 und 5xx.
+// Mit wiederhole403 auch bei 403, weil manche CDNs Anfragen aus Rechenzentren zeitweise abweisen.
+async function holeText(url, { timeout = 30000, accept = "*/*", versuche = 2, wiederhole403 = false } = {}) {
+  for (let versuch = 1; ; versuch++) {
+    let res;
+    try {
+      res = await fetch(url, {
+        headers: { "user-agent": UA, accept, "accept-language": "de-DE,de;q=0.9" },
+        signal: AbortSignal.timeout(timeout),
+      });
+    } catch (e) {
+      if (versuch >= versuche) throw e;
+      await warte(2000 * 3 ** (versuch - 1));
+      continue;
+    }
+    if (res.ok) return res.text();
+    const fehler = new Error(`${new URL(url).host} antwortete mit HTTP ${res.status}`);
+    const vorlaeufig = res.status === 429 || res.status >= 500 || (wiederhole403 && res.status === 403);
+    if (!vorlaeufig || versuch >= versuche) throw fehler;
+    await warte(2000 * 3 ** (versuch - 1));
+  }
 }
 
 const slug = (s) =>
@@ -193,6 +210,16 @@ async function jobFaktenchecks() {
   return { "v1/faktenchecks.json": body("bundestakt", { daten }) };
 }
 
+// Einzelne Spenden listet der Bundestag erst ab 2009. Für 2002 bis 2008 gibt es auf den Seiten
+// nur Drucksachennummern je Monat, ohne Spender und Beträge.
+const ERSTES_SPENDENJAHR = 2009;
+
+// Bis 2020 steht der Betrag ohne "Euro" in der Zelle ("500.000,00", "77.750 5" mit Fußnote),
+// ab 2021 mit ("50.001 Euro").
+const BETRAG = /^\s*(\d{1,3}(?:\.\d{3})+|\d+)(?:,(\d{1,2}))?(?:\s*(?:Euro|€))?/;
+// Muss mit einer Zahl beginnen, sonst zählt die Kopfzeile "Spende in €" mit
+const istBetrag = (zelle) => BETRAG.test(textVon(zelle));
+
 const jobSpenden = (jahr) => async () => {
   const html = await holeText(`${QUELLEN.bundestag.url}/${jahr}`);
   const schwelle = new RegExp(`über\\s+([\\d.]+)\\s*€\\s*[-–]\\s*Jahr\\s*${jahr}`).exec(textVon(html))?.[1];
@@ -202,17 +229,17 @@ const jobSpenden = (jahr) => async () => {
   for (const tr of html.matchAll(/<tr\b[\s\S]*?<\/tr>/gi)) {
     const zellen = [...tr[0].matchAll(/<t[dh]\b[^>]*>([\s\S]*?)<\/t[dh]>/gi)].map((m) => m[1]);
     let partei, r;
-    if (zellen.length >= 4 && /Euro/.test(textVon(zellen[1]))) {
+    if (zellen.length >= 4 && istBetrag(zellen[1]) && !istBetrag(zellen[0])) {
       partei = textVon(zellen[0]);
       r = zellen.slice(1);
-    } else if (zellen.length >= 3 && /Euro/.test(textVon(zellen[0])) && letzte) {
+    } else if (zellen.length >= 3 && istBetrag(zellen[0]) && letzte) {
       partei = letzte;
       r = zellen;
     } else continue;
     letzte = partei;
 
-    const betragText = textVon(r[0]);
-    const m = /(\d{1,3}(?:\.\d{3})+|\d+)(?:,(\d{1,2}))?\s*Euro/.exec(betragText);
+    const betragText = textVon(r[0]).replace(/\(Interner Link\)/gi, "").trim();
+    const m = BETRAG.exec(betragText);
     const betrag = m ? Number.parseFloat(m[1].replace(/\./g, "") + (m[2] ? "." + m[2] : "")) : null;
     const zeilen = zeilenVon(r[1] ?? "");
     const d1 = textVon(r[2] ?? "");
@@ -292,18 +319,37 @@ const jobWeltbank = (id) => async () => {
   return { [`v1/weltbank/${id}.json`]: body("weltbank", { preset: id, indikator: p.code, einheit: p.einheit, laender }) };
 };
 
+// abgeordnetenwatch steht hinter einem CDN, das Anfragen aus Rechenzentren (z. B. GitHub Actions)
+// zeitweise mit 403 abweist. Deshalb: Parlament und Wahlperiode aus dem letzten Lauf merken, sodass
+// normalerweise nur eine Anfrage nötig ist, und bei 403 mit Pause wiederholen.
+const AW_IDS = join(CACHE, "abgeordnetenwatch_ids.json");
+
 async function jobAbgeordnetenwatch() {
-  const aw = async (pfad) => JSON.parse(await holeText(`https://www.abgeordnetenwatch.de/api/v2/${pfad}`, { accept: "application/json" }));
-  const parlamente = (await aw("parliaments?range_end=100")).data ?? [];
-  const bt = parlamente.find((p) => p.label === "Bundestag");
-  if (!bt) throw new Error("Bundestag bei abgeordnetenwatch nicht gefunden");
-  const perioden = (await aw(`parliament-periods?parliament=${bt.id}&type=legislature&range_end=30`)).data ?? [];
-  const aktuell = [...perioden].sort((a, b) => String(b.start_date_period ?? "").localeCompare(String(a.start_date_period ?? "")))[0];
-  if (!aktuell) throw new Error("Keine Wahlperiode gefunden");
+  const aw = async (pfad) => JSON.parse(await holeText(`https://www.abgeordnetenwatch.de/api/v2/${pfad}`,
+    { accept: "application/json", versuche: 4, wiederhole403: true }));
+
+  let gemerkt = null;
+  try { gemerkt = JSON.parse(await readFile(AW_IDS, "utf8")); } catch { /* erster Lauf */ }
+
+  let parlamente = gemerkt?.parlamente;
+  let bt = gemerkt?.bundestag;
+  let aktuell = gemerkt?.wahlperiode;
+  // Einmal im Monat neu nachsehen, ob eine neue Wahlperiode begonnen hat
+  const veraltet = !gemerkt?.geprueft || Date.now() - Date.parse(gemerkt.geprueft) > 30 * 864e5;
+  if (!bt || !aktuell || veraltet) {
+    parlamente = ((await aw("parliaments?range_end=100")).data ?? []).map((p) => ({ id: p.id, label: p.label }));
+    bt = parlamente.find((p) => p.label === "Bundestag");
+    if (!bt) throw new Error("Bundestag bei abgeordnetenwatch nicht gefunden");
+    const perioden = (await aw(`parliament-periods?parliament=${bt.id}&type=legislature&range_end=30`)).data ?? [];
+    aktuell = [...perioden].sort((a, b) => String(b.start_date_period ?? "").localeCompare(String(a.start_date_period ?? "")))[0];
+    if (!aktuell) throw new Error("Keine Wahlperiode gefunden");
+    await schreibe(CACHE, "abgeordnetenwatch_ids.json", JSON.stringify({ parlamente, bundestag: bt, wahlperiode: aktuell, geprueft: new Date().toISOString() }));
+  }
+
   const abstimmungen = (await aw(`polls?field_legislature=${aktuell.id}&sort_by=field_poll_date&sort_direction=desc&range_end=100`)).data ?? [];
   return {
     "v1/abgeordnetenwatch/bundestag.json": body("abgeordnetenwatch", {
-      parlamente: parlamente.map((p) => ({ id: p.id, label: p.label })),
+      parlamente: (parlamente ?? []).map((p) => ({ id: p.id, label: p.label })),
       bundestag: { id: bt.id, wahlperiode: aktuell },
       abstimmungen,
     }),
@@ -1098,12 +1144,12 @@ function jobs() {
     { id: "dawum", quelle: "dawum", alleMinuten: 30, run: jobDawum },
     ...Object.keys(FEEDS).map((id) => ({ id: `news:${id}`, quelle: FEEDS[id].name, alleMinuten: 30, run: jobNachrichten(id) })),
     { id: "faktenchecks", quelle: "bundestakt", alleMinuten: 60, run: jobFaktenchecks },
-    { id: "abgeordnetenwatch", quelle: "abgeordnetenwatch", alleMinuten: 360, run: jobAbgeordnetenwatch },
-    ...Object.keys(EUROSTAT).map((id) => ({ id: `eurostat:${id}`, quelle: "eurostat", alleMinuten: 720, run: jobEurostat(id) })),
-    ...Object.keys(WELTBANK).map((id) => ({ id: `weltbank:${id}`, quelle: "weltbank", alleMinuten: 1440, run: jobWeltbank(id) })),
+    { id: "abgeordnetenwatch", quelle: "abgeordnetenwatch", alleMinuten: 360, run: jobAbgeordnetenwatch, signatur: "aw-2" },
+    ...Object.keys(EUROSTAT).map((id) => ({ id: `eurostat:${id}`, quelle: "eurostat", alleMinuten: 720, run: jobEurostat(id), signatur: `${EUROSTAT[id].dataset}?${EUROSTAT[id].filter}` })),
+    ...Object.keys(WELTBANK).map((id) => ({ id: `weltbank:${id}`, quelle: "weltbank", alleMinuten: 1440, run: jobWeltbank(id), signatur: WELTBANK[id].code })),
   ];
-  for (let j = 2002; j <= jahr; j++) {
-    liste.push({ id: `spenden:${j}`, quelle: "bundestag", alleMinuten: j >= jahr - 1 ? 360 : 43200, run: jobSpenden(j) });
+  for (let j = ERSTES_SPENDENJAHR; j <= jahr; j++) {
+    liste.push({ id: `spenden:${j}`, quelle: "bundestag", alleMinuten: j >= jahr - 1 ? 360 : 43200, run: jobSpenden(j), signatur: "spenden-2" });
   }
   liste.push({ id: "parlament", quelle: "bundestagStammdaten", alleMinuten: 720, run: jobParlament });
   liste.push({ id: "wahlen", quelle: "wikipedia", alleMinuten: 360, run: jobWahlen });
@@ -1127,7 +1173,7 @@ function statischeDateien() {
       ],
     }),
     "v1/nachrichten/index.json": j({ feeds: Object.entries(FEEDS).map(([id, f]) => ({ id, name: f.name, url: f.seite })) }),
-    "v1/spenden/index.json": j({ aktuellesJahr: aktuell, jahre: Array.from({ length: aktuell - 2002 + 1 }, (_, i) => aktuell - i) }),
+    "v1/spenden/index.json": j({ aktuellesJahr: aktuell, erstesJahr: ERSTES_SPENDENJAHR, jahre: Array.from({ length: aktuell - ERSTES_SPENDENJAHR + 1 }, (_, i) => aktuell - i) }),
     "v1/eurostat/index.json": j({ presets: Object.entries(EUROSTAT).map(([id, p]) => ({ id, dataset: p.dataset, einheit: p.einheit, takt: p.takt })) }),
     "v1/weltbank/index.json": j({ presets: Object.entries(WELTBANK).map(([id, p]) => ({ id, indikator: p.code, einheit: p.einheit })) }),
   };
@@ -1153,6 +1199,9 @@ async function schreibe(basis, pfad, text) {
 
 function istFaellig(rec, job) {
   if (!rec) return true;
+  if (process.env.ALLES_NEU === "1") return true;
+  // Geänderte Konfiguration (z. B. neuer Eurostat-Datensatz) sofort neu laden
+  if ((job.signatur ?? null) !== (rec.signatur ?? null)) return true;
   const alter = Date.now() - Date.parse(rec.versuch);
   const intervall = rec.ok ? job.alleMinuten : Math.min(job.alleMinuten, 180);
   return !(alter < intervall * 60 * 1000 - TOLERANZ_MS);
@@ -1166,13 +1215,15 @@ async function verarbeite(job) {
   const jetzt = new Date().toISOString();
   try {
     const dateien = await job.run();
-    const rec = { ok: true, versuch: jetzt, erfolg: jetzt, dauerMs: Date.now() - t0, fehler: null, dateien };
+    const rec = { ok: true, versuch: jetzt, erfolg: jetzt, dauerMs: Date.now() - t0, fehler: null, dateien, signatur: job.signatur ?? null };
     await schreibe(CACHE, `${job.id.replace(/[^a-z0-9]+/gi, "_")}.json`, JSON.stringify(rec));
     return { job, rec, neu: true };
   } catch (e) {
     const rec = {
       ok: false, versuch: jetzt, erfolg: alt?.erfolg ?? null, dauerMs: Date.now() - t0,
       fehler: String(e?.message ?? e).slice(0, 300), dateien: alt?.dateien ?? {},
+      // Signatur nur übernehmen, wenn der Fehler mit der neuen Konfiguration passiert ist
+      signatur: job.signatur ?? null,
     };
     await schreibe(CACHE, `${job.id.replace(/[^a-z0-9]+/gi, "_")}.json`, JSON.stringify(rec));
     return { job, rec, neu: true };
