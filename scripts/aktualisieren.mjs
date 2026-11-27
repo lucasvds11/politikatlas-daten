@@ -1,12 +1,14 @@
 // Politikatlas Daten
 // Holt alle Quellen, bereitet sie auf und schreibt statische JSON-Dateien nach ./public.
 // Lauf: node scripts/aktualisieren.mjs   (Node 20+, keine Abhängigkeiten)
+// Von Hand gepflegt: hinweis.json im Hauptordner (Hinweis-Box der App, siehe hinweisDatei)
 // Optionales Secret: DIP_KEY (Bundestag DIP)
 
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { inflateRawSync } from "node:zlib";
+import { createHash } from "node:crypto";
 
 const UA = "Politikatlas/1.0 (+https://politikatlas.com)";
 const CACHE = ".cache";
@@ -16,7 +18,7 @@ const TOLERANZ_MS = 5 * 60 * 1000;
 const QUELLEN = {
   dawum: { name: "DAWUM", url: "https://dawum.de/", lizenz: "ODbL 1.0", lizenzUrl: "https://opendatacommons.org/licenses/odbl/1-0/" },
   bundestakt: { name: "Bundestakt", url: "https://www.bundestakt.de/api-doku", lizenz: "CC BY 4.0", lizenzUrl: "https://creativecommons.org/licenses/by/4.0/" },
-  bundestag: { name: "Deutscher Bundestag – Parteispenden über 50.000 €", url: "https://www.bundestag.de/parlament/praesidium/parteienfinanzierung/fundstellen50000", lizenz: null, lizenzUrl: null },
+  bundestag: { name: "Deutscher Bundestag – Großspenden an Parteien (PartG § 25)", url: "https://www.bundestag.de/parlament/praesidium/parteienfinanzierung/fundstellen50000", lizenz: null, lizenzUrl: null },
   eurostat: { name: "Eurostat", url: "https://ec.europa.eu/eurostat", lizenz: null, lizenzUrl: null },
   weltbank: { name: "Weltbank", url: "https://data.worldbank.org/", lizenz: "CC BY 4.0", lizenzUrl: "https://creativecommons.org/licenses/by/4.0/" },
   abgeordnetenwatch: { name: "abgeordnetenwatch.de", url: "https://www.abgeordnetenwatch.de/api", lizenz: null, lizenzUrl: null },
@@ -24,6 +26,9 @@ const QUELLEN = {
   bundestagStammdaten: { name: "Deutscher Bundestag – Stammdaten aller Abgeordneten seit 1949", url: "https://www.bundestag.de/services/opendata", lizenz: null, lizenzUrl: null },
   bundeswahlleiterin: { name: "Die Bundeswahlleiterin – Wahlkreisergebnisse", url: "https://www.bundeswahlleiterin.de/bundestagswahlen/", lizenz: "Datenlizenz Deutschland – Namensnennung – Version 2.0", lizenzUrl: "https://www.govdata.de/dl-de/by-2-0" },
   wikidata: { name: "Wikidata", url: "https://www.wikidata.org/", lizenz: "CC0 1.0", lizenzUrl: "https://creativecommons.org/publicdomain/zero/1.0/" },
+  wikipedia: { name: "Wikipedia", url: "https://de.wikipedia.org/", lizenz: "CC BY-SA 4.0", lizenzUrl: "https://creativecommons.org/licenses/by-sa/4.0/deed.de" },
+  eurostatRegional: { name: "Eurostat – Regionalstatistik (NUTS 1)", url: "https://ec.europa.eu/eurostat/web/regions/database", lizenz: null, lizenzUrl: null },
+  politikatlas: { name: "Politikatlas", url: "https://politikatlas.com", lizenz: null, lizenzUrl: null },
 };
 
 const FEEDS = {
@@ -36,7 +41,8 @@ const FEEDS = {
 
 const EUROSTAT = {
   arbeitslosenquote: { dataset: "une_rt_m", filter: "freq=M&s_adj=SA&age=TOTAL&unit=PC_ACT&sex=T", einheit: "% der Erwerbspersonen", takt: "M" },
-  inflation: { dataset: "prc_hicp_manr", filter: "freq=M&unit=RCH_A&coicop=CP00", einheit: "% zum Vorjahr", takt: "M" },
+  // prc_hicp_manr endet mit Dezember 2025, Nachfolger ist prc_hicp_minr (ECOICOP 2)
+  inflation: { dataset: "prc_hicp_minr", filter: "freq=M&unit=RCH_A&coicop18=TOTAL", einheit: "% zum Vorjahr", takt: "M" },
   "bip-wachstum": { dataset: "namq_10_gdp", filter: "freq=Q&unit=CLV_PCH_PRE&s_adj=SCA&na_item=B1GQ", einheit: "% zum Vorquartal", takt: "Q" },
   staatsverschuldung: { dataset: "gov_10q_ggdebt", filter: "freq=Q&unit=PC_GDP&sector=S13&na_item=GD", einheit: "% des BIP", takt: "Q" },
   industrieproduktion: { dataset: "sts_inpr_m", filter: "freq=M&indic_bt=PRD&nace_r2=B-D&s_adj=CA&unit=PCH_SM", einheit: "% zum Vorjahresmonat", takt: "M" },
@@ -53,9 +59,9 @@ const WELTBANK = {
 
 // ---------- Hilfsfunktionen ----------
 
-async function holeText(url, { timeout = 30000 } = {}) {
+async function holeText(url, { timeout = 30000, accept = "*/*" } = {}) {
   const res = await fetch(url, {
-    headers: { "user-agent": UA, accept: "*/*" },
+    headers: { "user-agent": UA, accept },
     signal: AbortSignal.timeout(timeout),
   });
   if (!res.ok) throw new Error(`${new URL(url).host} antwortete mit HTTP ${res.status}`);
@@ -287,7 +293,7 @@ const jobWeltbank = (id) => async () => {
 };
 
 async function jobAbgeordnetenwatch() {
-  const aw = async (pfad) => JSON.parse(await holeText(`https://www.abgeordnetenwatch.de/api/v2/${pfad}`));
+  const aw = async (pfad) => JSON.parse(await holeText(`https://www.abgeordnetenwatch.de/api/v2/${pfad}`, { accept: "application/json" }));
   const parlamente = (await aw("parliaments?range_end=100")).data ?? [];
   const bt = parlamente.find((p) => p.label === "Bundestag");
   if (!bt) throw new Error("Bundestag bei abgeordnetenwatch nicht gefunden");
@@ -532,6 +538,7 @@ function werteAus(mitglieder, heute) {
   return {
     wahlperiode: aktuell,
     wahljahr: Number(start.slice(0, 4)),
+    vorherigesWahljahr: Number(beginn(wps.at(-2)).start.slice(0, 4)),
     gesamt: aktuelleListe.length,
     fraktionen,
     frauenanteil: {
@@ -605,6 +612,10 @@ async function ladeDirektmandate(w) {
     mitMandat: w.direktGesamt,
     ohneMandat: beste.size - w.direktGesamt,
     parteien,
+    wahljahr: w.wahljahr,
+    vorherigesWahljahr: w.vorherigesWahljahr,
+    vorherigeWahl: w.direktVorher,
+    // Alter Name, bleibt für ältere App-Versionen erhalten
     wahl2021: w.direktVorher,
   };
 }
@@ -730,6 +741,357 @@ async function jobParlament() {
   };
 }
 
+// ---------- Wahlen und Länder ----------
+// Wahlergebnisse und Landesregierungen: Wikipedia. Einwohner und Fläche: Eurostat (NUTS 1 = Bundesländer).
+// Fällt eine Teilquelle aus, bleibt der letzte Stand dieser Teilquelle erhalten.
+
+/** Daten, deren Stichtag länger zurückliegt, gelten nicht mehr als aktuell und werden nicht veröffentlicht. */
+const MAX_ALTER_JAHRE = 2;
+
+const PARLAMENTE = [
+  { id: "bundestag", kuerzel: "DE", name: "Bundestag", wiki: "Deutscher Bundestag" },
+  { id: "baden-wuerttemberg", kuerzel: "BW", nuts: "DE1", name: "Baden-Württemberg", wiki: "Landtag von Baden-Württemberg" },
+  { id: "bayern", kuerzel: "BY", nuts: "DE2", name: "Bayern", wiki: "Bayerischer Landtag" },
+  { id: "berlin", kuerzel: "BE", nuts: "DE3", name: "Berlin", wiki: "Abgeordnetenhaus Berlin" },
+  { id: "brandenburg", kuerzel: "BB", nuts: "DE4", name: "Brandenburg", wiki: "Landtag Brandenburg" },
+  { id: "bremen", kuerzel: "HB", nuts: "DE5", name: "Bremen", wiki: "Bremische Bürgerschaft" },
+  { id: "hamburg", kuerzel: "HH", nuts: "DE6", name: "Hamburg", wiki: "Hamburgische Bürgerschaft" },
+  { id: "hessen", kuerzel: "HE", nuts: "DE7", name: "Hessen", wiki: "Hessischer Landtag" },
+  { id: "mecklenburg-vorpommern", kuerzel: "MV", nuts: "DE8", name: "Mecklenburg-Vorpommern", wiki: "Landtag Mecklenburg-Vorpommern" },
+  { id: "niedersachsen", kuerzel: "NI", nuts: "DE9", name: "Niedersachsen", wiki: "Niedersächsischer Landtag" },
+  { id: "nordrhein-westfalen-nrw", kuerzel: "NW", nuts: "DEA", name: "Nordrhein-Westfalen", wiki: "Landtag Nordrhein-Westfalen" },
+  { id: "rheinland-pfalz", kuerzel: "RP", nuts: "DEB", name: "Rheinland-Pfalz", wiki: "Landtag Rheinland-Pfalz" },
+  { id: "saarland", kuerzel: "SL", nuts: "DEC", name: "Saarland", wiki: "Landtag des Saarlandes" },
+  { id: "sachsen", kuerzel: "SN", nuts: "DED", name: "Sachsen", wiki: "Sächsischer Landtag" },
+  { id: "sachsen-anhalt", kuerzel: "ST", nuts: "DEE", name: "Sachsen-Anhalt", wiki: "Landtag von Sachsen-Anhalt" },
+  { id: "schleswig-holstein", kuerzel: "SH", nuts: "DEF", name: "Schleswig-Holstein", wiki: "Schleswig-Holsteinischer Landtag" },
+  { id: "thueringen", kuerzel: "TH", nuts: "DEG", name: "Thüringen", wiki: "Thüringer Landtag" },
+];
+const LAENDER = PARLAMENTE.filter((p) => p.nuts);
+
+const zuAlt = (iso) => !iso || Date.now() - Date.parse(iso) > MAX_ALTER_JAHRE * 365.2425 * 864e5;
+
+async function vorherigeAusCache(id, pfad) {
+  try {
+    return JSON.parse((await ladeCache(id))?.dateien?.[pfad]);
+  } catch {
+    return null;
+  }
+}
+
+async function wikitext(seite) {
+  const url = `https://de.wikipedia.org/w/api.php?action=parse&prop=wikitext&format=json&formatversion=2&redirects=1&page=${encodeURIComponent(seite)}`;
+  const d = JSON.parse(await holeText(url, { accept: "application/json" }));
+  const text = d?.parse?.wikitext;
+  if (typeof text !== "string" || !text) throw new Error(`Wikipedia-Seite fehlt: ${seite}`);
+  return text;
+}
+
+const MONATE = ["januar", "februar", "märz", "april", "mai", "juni", "juli", "august", "september", "oktober", "november", "dezember"];
+
+/** "8. März 2026" → "2026-03-08" */
+function isoVonLangDatum(s) {
+  const m = /(\d{1,2})\.\s*([A-Za-zÄÖÜäöü]+)\s+(\d{4})/.exec(s ?? "");
+  if (!m) return null;
+  const monat = MONATE.indexOf(m[2].toLowerCase()) + 1;
+  return monat ? `${m[3]}-${String(monat).padStart(2, "0")}-${m[1].padStart(2, "0")}` : null;
+}
+
+const langDatum = (iso) =>
+  new Date(`${iso}T12:00:00Z`).toLocaleDateString("de-DE", { day: "numeric", month: "long", year: "numeric", timeZone: "UTC" });
+
+/** Wikitext ohne Links, Vorlagen, Einzelnachweise und HTML */
+function wikiKlartext(s) {
+  return entit(String(s ?? ""))
+    .replace(/<ref[^>]*\/>/g, "")
+    .replace(/<ref[\s\S]*?<\/ref>/g, "")
+    .replace(/\{\{[^{}]*\}\}/g, "")
+    .replace(/\[\[(?:[^\]|]*\|)?([^\]]*)\]\]/g, "$1")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/'{2,}/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** Alle Vorlagen {{name …}} samt verschachtelter Vorlagen */
+function vorlagen(text, name) {
+  const treffer = [];
+  const kopf = new RegExp(`\\{\\{\\s*${name}\\s*(?=\\|)`, "g");
+  let m;
+  while ((m = kopf.exec(text))) {
+    let tiefe = 0;
+    let i = m.index;
+    for (; i < text.length - 1; i++) {
+      if (text[i] === "{" && text[i + 1] === "{") { tiefe++; i++; }
+      else if (text[i] === "}" && text[i + 1] === "}") { tiefe--; i++; if (tiefe === 0) break; }
+    }
+    treffer.push(text.slice(m.index, i + 1));
+    kopf.lastIndex = i + 1;
+  }
+  return treffer;
+}
+
+function vorlagenWerte(vorlage) {
+  const werte = {};
+  for (const m of vorlage.matchAll(/^\s*\|\s*([A-Za-zÄÖÜäöü0-9_]+)\s*=\s*(.*?)\s*$/gm)) werte[m[1].toUpperCase()] = m[2];
+  return werte;
+}
+
+const zahlWiki = (s) => {
+  const m = /-?\d+(?:[.,]\d+)?/.exec(String(s ?? ""));
+  return m ? Number(m[0].replace(",", ".")) : null;
+};
+
+function wahlPartei(roh) {
+  const t = wikiKlartext(roh);
+  if (/^sonst/i.test(t)) return "Sonstige";
+  if (/^(union|cdu\/csu)$/i.test(t)) return "CDU/CSU";
+  if (/^csu/i.test(t)) return "CSU";
+  if (/^fw\b|freie wähler/i.test(t)) return "Freie Wähler";
+  if (/^tier/i.test(t)) return "Tierschutzpartei";
+  if (/^(die)?basis$/i.test(t)) return "dieBasis";
+  if (/^(die )?partei$/i.test(t)) return "Die PARTEI";
+  return parteiKurz(t);
+}
+
+/** Ergebnis aus dem Wahldiagramm des Wahlartikels (Zweitstimmen bzw. Landesstimmen) */
+function wahlergebnis(text, jahr) {
+  const diagramme = vorlagen(text, "Wahldiagramm")
+    .map(vorlagenWerte)
+    .filter((w) => String(w.TITEL ?? "").includes(String(jahr)))
+    .filter((w) => !/erststimm|wahlkreis/i.test(`${w.TITEL ?? ""} ${w.TITEL2 ?? ""}`));
+  const w = diagramme.find((d) => Object.keys(d).some((k) => k.startsWith("ERGEBNISALT"))) ?? diagramme[0];
+  if (!w) throw new Error(`Kein Wahldiagramm für ${jahr}`);
+
+  const ergebnisse = [];
+  for (let i = 1; i <= 40; i++) {
+    const partei = w[`PARTEI${i}`];
+    const prozent = zahlWiki(w[`ERGEBNIS${i}`] ?? w[`ERGEBNISNEU${i}`]);
+    if (!partei || prozent === null) continue;
+    ergebnisse.push({ partei: wahlPartei(partei), prozent, vorher: zahlWiki(w[`ERGEBNISALT${i}`]) });
+  }
+  const summe = ergebnisse.reduce((s, e) => s + e.prozent, 0);
+  if (ergebnisse.length < 3 || summe < 85 || summe > 101) throw new Error(`Unplausibles Wahlergebnis (${ergebnisse.length} Parteien, Summe ${rund1(summe)})`);
+
+  const beteiligung =
+    /Wahlbeteiligung[^0-9<]*(\d{2}(?:[.,]\d+)?)\s*%/.exec(`${w.TITEL2 ?? ""} ${w.TITEL ?? ""}`)?.[1] ??
+    /Wahlbeteiligung (?:lag bei|betrug|stieg auf|sank auf|erreichte) (\d{2}(?:,\d+)?)\s*(?:%|Prozent)/.exec(text)?.[1];
+  return {
+    beteiligung: beteiligung ? Number(beteiligung.replace(",", ".")) : null,
+    vorherigesJahr: zahlWiki(w.JAHRALT),
+    ergebnisse: ergebnisse.sort((a, b) => (a.partei === "Sonstige") - (b.partei === "Sonstige") || b.prozent - a.prozent),
+  };
+}
+
+async function jobWahlen() {
+  const vorher = await vorherigeAusCache("wahlen", "v1/wahlen.json");
+  const wahlen = [];
+  const fehler = [];
+
+  for (const p of PARLAMENTE) {
+    try {
+      const info = await wikitext(p.wiki);
+      const m = /\|\s*Letzte[ _]Wahl\s*=\s*\[\[([^\]|]+)\|([^\]]+)\]\]/.exec(info);
+      if (!m) throw new Error("Feld „Letzte Wahl“ fehlt");
+      const seite = m[1].trim();
+      const datum = isoVonLangDatum(m[2]);
+      const jahr = Number(datum?.slice(0, 4) ?? /\d{4}/.exec(seite)?.[0]);
+      if (!datum || !jahr) throw new Error(`Wahldatum nicht lesbar: ${m[2]}`);
+      const naechste = wikiKlartext(/\|\s*Nächste[ _]Wahl\s*=\s*(.*)/.exec(info)?.[1] ?? "") || null;
+
+      wahlen.push({
+        parlament: p.id,
+        kuerzel: p.kuerzel,
+        name: p.name,
+        titel: seite,
+        datum,
+        naechsteWahl: naechste,
+        link: `https://de.wikipedia.org/wiki/${encodeURIComponent(seite.replace(/ /g, "_"))}`,
+        ...wahlergebnis(await wikitext(seite), jahr),
+      });
+    } catch (e) {
+      fehler.push(`${p.kuerzel}: ${e.message}`);
+      const alt = vorher?.wahlen?.find((w) => w.parlament === p.id);
+      if (alt) wahlen.push(alt);
+    }
+  }
+
+  if (fehler.length) console.warn(`Wahlen: ${fehler.join("; ")}`);
+  if (wahlen.length < 12) throw new Error(`Zu wenige Wahlen gelesen – ${fehler.join("; ")}`);
+  wahlen.sort((a, b) => b.datum.localeCompare(a.datum));
+  return {
+    "v1/wahlen.json": body("wikipedia", {
+      stand: new Date().toISOString().slice(0, 10),
+      hinweis: "Ergebnisse laut Wikipedia. Maßgeblich sind die amtlichen Endergebnisse der Wahlleitungen.",
+      wahlen,
+    }),
+  };
+}
+
+/** Aktuelle Landesregierungen aus der Übersichtstabelle im Artikel „Landesregierung (Deutschland)“ */
+function landesregierungen(text) {
+  const start = text.indexOf("{|");
+  const tabelle = text.slice(start, text.indexOf("\n|}", start));
+  const ergebnis = new Map();
+
+  for (const roh of tabelle.split(/\n\|-/)) {
+    const kuerzel = /\{\{DE-([A-Z]{2})\}\}/.exec(roh)?.[1];
+    if (!kuerzel) continue;
+    const zeile = roh.replace(/<span[\s\S]*?<\/span>/g, "").replace(/&#160;|&nbsp;/g, " ");
+    const kabinett = /\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/.exec(zeile)?.[1]?.trim() ?? null;
+    const chef = /\[\[([^\]|]+)(?:\|([^\]]+))?\]\]\s*\(([^)]+)\)/.exec(zeile);
+    const datum = /DatumZelle\|(\d{4}-\d{2}-\d{2})/.exec(zeile);
+    if (!chef || !datum) continue;
+
+    const zwischen = zeile.slice(chef.index + chef[0].length, datum.index);
+    const koalition = wikiKlartext(zwischen.replace(/\|\|/g, " "))
+      .replace(/[|{}]/g, " ")
+      .split(",")
+      .map((x) => wahlPartei(x.trim()))
+      .filter(Boolean);
+    if (!koalition.length) continue;
+
+    ergebnis.set(kuerzel, {
+      chef: (chef[2] ?? chef[1]).trim(),
+      partei: wahlPartei(chef[3]),
+      koalition,
+      kabinett,
+      seit: datum[1],
+    });
+  }
+  if (ergebnis.size !== 16) throw new Error(`Landesregierungen: ${ergebnis.size} statt 16 Länder gelesen`);
+  return ergebnis;
+}
+
+/** Werte je NUTS-Region und Jahr aus einem Eurostat-Datensatz */
+async function eurostatLaender(dataset, filter) {
+  const geo = LAENDER.map((l) => `geo=${l.nuts}`).join("&");
+  const seit = new Date().getUTCFullYear() - 5;
+  const url = `https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data/${dataset}?format=JSON&lang=DE&${filter}&${geo}&sinceTimePeriod=${seit}`;
+  const js = JSON.parse(await holeText(url, { timeout: 60000 }));
+  const ids = js.id;
+  const gi = ids.indexOf("geo");
+  const ti = ids.indexOf("time");
+  if (gi < 0 || ti < 0) throw new Error(`Unerwartetes Eurostat-Format (${dataset})`);
+  const schritt = new Array(ids.length);
+  let s = 1;
+  for (let i = ids.length - 1; i >= 0; i--) { schritt[i] = s; s *= js.size[i]; }
+  const geoIdx = indexKarte(js.dimension.geo.category);
+  const jahre = Object.entries(indexKarte(js.dimension.time.category)).sort((a, b) => b[0].localeCompare(a[0]));
+
+  // Neuestes Jahr, für das alle 16 Länder einen Wert haben
+  for (const [jahr, t] of jahre) {
+    const werte = {};
+    for (const l of LAENDER) {
+      const v = js.value?.[geoIdx[l.nuts] * schritt[gi] + t * schritt[ti]];
+      if (v !== null && v !== undefined) werte[l.kuerzel] = v;
+    }
+    if (Object.keys(werte).length === LAENDER.length) return { jahr, werte };
+  }
+  throw new Error(`Eurostat ${dataset}: kein Jahr mit Werten für alle Länder`);
+}
+
+async function jobLaender() {
+  const vorher = await vorherigeAusCache("laender", "v1/laender.json");
+  const altLand = (k) => vorher?.laender?.find((l) => l.kuerzel === k);
+  const heute = new Date().toISOString().slice(0, 10);
+  const fehler = [];
+
+  // Einwohner am 1. Januar
+  let einwohner = null;
+  let einwohnerStichtag = vorher?.einwohnerStichtag ?? null;
+  try {
+    const e = await eurostatLaender("demo_r_d2jan", "sex=T&age=TOTAL&unit=NR");
+    einwohner = e.werte;
+    einwohnerStichtag = `${e.jahr}-01-01`;
+  } catch (e) {
+    fehler.push(e.message);
+  }
+  if (zuAlt(einwohnerStichtag)) einwohnerStichtag = null;
+
+  // Fläche in km²
+  let flaeche = null;
+  let flaecheJahr = vorher?.flaecheJahr ?? null;
+  try {
+    const f = await eurostatLaender("reg_area3", "landuse=TOTAL&unit=KM2");
+    flaeche = f.werte;
+    flaecheJahr = f.jahr;
+  } catch (e) {
+    fehler.push(e.message);
+  }
+
+  // Regierungen
+  let regierungen = null;
+  try {
+    regierungen = landesregierungen(await wikitext("Landesregierung (Deutschland)"));
+  } catch (e) {
+    fehler.push(e.message);
+  }
+
+  // Für den Hinweis "geschäftsführend": Landtagswahl nach Amtsantritt der Regierung
+  const wahlen = (await vorherigeAusCache("wahlen", "v1/wahlen.json"))?.wahlen ?? [];
+
+  const laender = LAENDER.map((l) => {
+    const alt = altLand(l.kuerzel);
+    const regierung = regierungen?.get(l.kuerzel) ?? alt?.regierung ?? null;
+    const wahl = wahlen.find((w) => w.parlament === l.id);
+    if (regierung) {
+      regierung.hinweis = wahl && regierung.seit && wahl.datum > regierung.seit
+        ? `Geschäftsführend im Amt bis zur Regierungsbildung nach der Wahl am ${langDatum(wahl.datum)}.`
+        : null;
+    }
+    return {
+      kuerzel: l.kuerzel,
+      slug: l.id,
+      name: l.name,
+      einwohner: einwohnerStichtag ? (einwohner?.[l.kuerzel] ?? alt?.einwohner ?? null) : null,
+      flaeche: flaeche?.[l.kuerzel] ?? alt?.flaeche ?? null,
+      regierung,
+    };
+  });
+
+  if (fehler.length) console.warn(`Länder: ${fehler.join("; ")}`);
+  if (!laender.some((l) => l.regierung) && !laender.some((l) => l.einwohner)) throw new Error(`Länderdaten fehlen – ${fehler.join("; ")}`);
+
+  return {
+    "v1/laender.json": body("eurostatRegional", {
+      quellen: [QUELLEN.eurostatRegional, QUELLEN.wikipedia],
+      stand: heute,
+      einwohnerStichtag,
+      flaecheJahr,
+      regierungenStand: regierungen ? heute : (vorher?.regierungenStand ?? null),
+      laender,
+    }),
+  };
+}
+
+// ---------- Hinweis-Box der App ----------
+// Wird von Hand in hinweis.json (im Hauptordner des Repos) gepflegt und bei jedem Lauf übernommen.
+// Format: { "aktiv": true, "farbe": "gruen" | "gelb" | "rot", "titel": "…", "text": "…", "link": "https://…", "linkText": "…", "bis": "2026-12-24T18:00:00+01:00" }
+
+async function hinweisDatei() {
+  const aus = JSON.stringify({ aktiv: false });
+  let roh;
+  try {
+    roh = JSON.parse(await readFile("hinweis.json", "utf8"));
+  } catch (e) {
+    if (e?.code !== "ENOENT") console.warn(`hinweis.json ist kein gültiges JSON und wird ignoriert: ${e.message}`);
+    return aus;
+  }
+  const text = typeof roh?.text === "string" ? roh.text.trim() : "";
+  const titel = typeof roh?.titel === "string" ? roh.titel.trim() : "";
+  if (roh?.aktiv !== true || (!text && !titel)) return aus;
+
+  const farbe = ["gruen", "gelb", "rot"].includes(roh.farbe) ? roh.farbe : "gelb";
+  const bis = roh.bis && Number.isFinite(Date.parse(roh.bis)) ? new Date(roh.bis).toISOString() : null;
+  if (bis && Date.parse(bis) < Date.now()) return aus;
+  const link = typeof roh.link === "string" && /^https:\/\/\S+$/.test(roh.link.trim()) ? roh.link.trim() : null;
+  const linkText = link && typeof roh.linkText === "string" && roh.linkText.trim() ? roh.linkText.trim() : null;
+  const id = createHash("sha256").update(JSON.stringify([farbe, titel, text, link])).digest("hex").slice(0, 16);
+
+  return JSON.stringify({ aktiv: true, id, farbe, titel: titel || null, text, link, linkText, bis });
+}
+
 function jobs() {
   const jahr = new Date().getUTCFullYear();
   const liste = [
@@ -744,6 +1106,8 @@ function jobs() {
     liste.push({ id: `spenden:${j}`, quelle: "bundestag", alleMinuten: j >= jahr - 1 ? 360 : 43200, run: jobSpenden(j) });
   }
   liste.push({ id: "parlament", quelle: "bundestagStammdaten", alleMinuten: 720, run: jobParlament });
+  liste.push({ id: "wahlen", quelle: "wikipedia", alleMinuten: 360, run: jobWahlen });
+  liste.push({ id: "laender", quelle: "eurostatRegional", alleMinuten: 360, run: jobLaender });
   if (process.env.DIP_KEY) liste.push({ id: "dip", quelle: "dip", alleMinuten: 360, run: jobDip });
   return liste;
 }
@@ -759,6 +1123,7 @@ function statischeDateien() {
         "v1/nachrichten/index.json", "v1/nachrichten/{feed}.json", "v1/faktenchecks.json",
         "v1/spenden/index.json", "v1/spenden/{jahr}.json", "v1/eurostat/index.json", "v1/eurostat/{preset}.json",
         "v1/weltbank/index.json", "v1/weltbank/{preset}.json", "v1/abgeordnetenwatch/bundestag.json", "v1/dip/ordnungsrufe.json", "v1/parlament.json",
+        "v1/laender.json", "v1/wahlen.json", "v1/hinweis.json",
       ],
     }),
     "v1/nachrichten/index.json": j({ feeds: Object.entries(FEEDS).map(([id, f]) => ({ id, name: f.name, url: f.seite })) }),
@@ -831,6 +1196,8 @@ export async function main() {
   const ergebnisse = await pool(alle, 6, verarbeite);
 
   for (const [pfad, text] of Object.entries(statischeDateien())) await schreibe(OUT, pfad, text);
+  // Der Hinweis wird bei jedem Lauf frisch übernommen, unabhängig von den Job-Intervallen.
+  await schreibe(OUT, "v1/hinweis.json", await hinweisDatei());
   for (const { rec } of ergebnisse) {
     for (const [pfad, text] of Object.entries(rec.dateien ?? {})) await schreibe(OUT, pfad, text);
   }
